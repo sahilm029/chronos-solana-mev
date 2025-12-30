@@ -2,10 +2,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use sha2::{Sha256, Digest};
-use csv::ByteRecord; // We need this for manual buffer management
-
-// Import the struct from our types module
-use crate::types::RawTradeRecord;
+use csv::ByteRecord;
+use crate::types::{RawTradeRecord, InternalTrade};
+use std::sync::mpsc::SyncSender; // Bounded Channel
 
 #[derive(thiserror::Error, Debug)]
 pub enum IngestError {
@@ -28,14 +27,13 @@ impl ProxyIngestor {
         }
     }
 
-    pub fn process_file<P, F>(
+    pub fn process_file<P>(
         &mut self, 
         path: P, 
-        mut on_record: F
+        sender: SyncSender<InternalTrade> 
     ) -> Result<String, IngestError> 
     where
         P: AsRef<Path>,
-        F: FnMut(RawTradeRecord) -> (), 
     {
         let file = File::open(path)?;
         let reader = BufReader::with_capacity(64 * 1024, file);
@@ -44,20 +42,22 @@ impl ProxyIngestor {
             .has_headers(true)
             .from_reader(reader);
 
-        // MANUAL BUFFER MANAGEMENT (The Fix)
-        // We create a reusable buffer. This is much faster than allocating a new one every row.
         let mut raw_record = ByteRecord::new();
 
-        // We loop by reading into this existing buffer
         while csv_rdr.read_byte_record(&mut raw_record)? {
-            
-            // We deserialize strictly from the 'raw_record' buffer
-            // This is allowed because 'record' dies at the end of the loop,
-            // just before 'raw_record' is overwritten.
             let record: RawTradeRecord = raw_record.deserialize(None)?;
-
+            
             self.update_hash(&record);
-            on_record(record);
+
+            // CONVERT IMMEDIATELY
+            // We must own the data to send it across threads.
+            // The 'RawTradeRecord' cannot leave this loop, so we convert to 'InternalTrade' here.
+            let trade: InternalTrade = record.into();
+
+            // SEND TO CHANNEL
+            // If the buffer is full, this waits (Backpressure).
+            // We unwrap because if the receiver hangs up, we should crash.
+            sender.send(trade).expect("Receiver hung up");
 
             self.records_processed += 1;
         }
